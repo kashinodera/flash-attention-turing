@@ -20,6 +20,7 @@ from flash_attention_interface import (
     flash_attn_varlen_func,
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
+    flash_attn_with_kvcache,
 )
 
 
@@ -45,6 +46,7 @@ BWD_TOLS = dict(
 
 DTYPES = [torch.float16]
 HEAD_DIMS = [64, 96, 128]
+ALL_HEAD_DIMS = [32, 64, 96, 128, 256]
 BATCH_SIZES = [1, 3]
 SOFTMAX_SCALES = [None, 0.3]
 # SOFTMAX_SCALES = [0.3]
@@ -1009,3 +1011,675 @@ def test_flash_attn_varlen_qkv(
         pairs=pairs,
     )
     _assert_metrics(bundle)
+
+
+# --------------------------------------------------------------------------------------
+# KV-cache decode (flash_attn_with_kvcache)
+
+
+def _kvcache_reference(
+    q: torch.Tensor,
+    k_cache_filled: torch.Tensor,
+    v_cache_filled: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """q: (B,1,Hq,D); caches already include the new token at the right positions."""
+    # (B, 1, H, D) -> attention over (B, H, 1, D) with keys/values (B, H, S, D)
+    # Expand GQA kv heads to query heads.
+    nheads = q.shape[2]
+    nheads_k = k_cache_filled.shape[2]
+    rep = nheads // nheads_k
+    if rep > 1:
+        k_exp = k_cache_filled.unsqueeze(3).expand(-1, -1, -1, rep, -1).flatten(2, 3)
+        v_exp = v_cache_filled.unsqueeze(3).expand(-1, -1, -1, rep, -1).flatten(2, 3)
+    else:
+        k_exp = k_cache_filled
+        v_exp = v_cache_filled
+    # Use only valid prefix per row is handled by caller filling the active prefix.
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k_exp.transpose(1, 2),
+        v_exp.transpose(1, 2),
+        scale=softmax_scale,
+    )
+    return out.transpose(1, 2).contiguous()
+
+
+def _kvcache_reference_lse(
+    q: torch.Tensor,
+    k_cache_filled: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """q: (B,1,Hq,D); k_cache_filled: (B,S,Hkv,D) valid prefix -> (B, Hq, 1) fp32."""
+    nheads = q.shape[2]
+    nheads_k = k_cache_filled.shape[2]
+    rep = nheads // nheads_k
+    if rep > 1:
+        k_exp = k_cache_filled.unsqueeze(3).expand(-1, -1, -1, rep, -1).flatten(2, 3)
+    else:
+        k_exp = k_cache_filled
+    scores = torch.einsum("bqhd,bshd->bhqs", q.float(), k_exp.float()) * softmax_scale
+    return scores.logsumexp(dim=-1).contiguous()
+
+
+def _run_kvcache_case(
+    device: torch.device,
+    batch: int,
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    capacity: int,
+    cache_lens: Sequence[int],
+    num_splits: int = 0,
+) -> None:
+    torch.manual_seed(0)
+    scale = head_dim ** -0.5
+
+    q = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    k_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_cache = torch.zeros(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_cache = torch.zeros(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_cache.copy_(torch.randn_like(k_cache))
+    v_cache.copy_(torch.randn_like(v_cache))
+
+    cache_seqlens = torch.tensor(list(cache_lens), dtype=torch.int32, device=device)
+
+    k_orig = k_cache.clone()
+    v_orig = v_cache.clone()
+
+    # Reference: append on a clone, attend over each row's valid prefix only.
+    k_ref = k_cache.clone()
+    v_ref = v_cache.clone()
+    outs = []
+    for b, sl in enumerate(cache_lens):
+        k_ref[b, sl] = k_new[b, 0]
+        v_ref[b, sl] = v_new[b, 0]
+        s = sl + 1
+        kb = k_ref[b : b + 1, :s]
+        vb = v_ref[b : b + 1, :s]
+        outs.append(_kvcache_reference(q[b : b + 1], kb, vb, scale))
+    out_ref = torch.cat(outs, dim=0)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=scale,
+        causal=False,
+        num_splits=num_splits,
+    )
+
+    torch.cuda.synchronize()
+
+    for b, sl in enumerate(cache_lens):
+        if sl > 0:
+            assert torch.equal(k_cache[b, :sl], k_orig[b, :sl]), f"row {b} prefix K mutated"
+            assert torch.equal(v_cache[b, :sl], v_orig[b, :sl]), f"row {b} prefix V mutated"
+        assert torch.equal(k_cache[b, sl], k_new[b, 0]), f"row {b} K append mismatch"
+        assert torch.equal(v_cache[b, sl], v_new[b, 0]), f"row {b} V append mismatch"
+        if sl + 1 < capacity:
+            assert torch.equal(k_cache[b, sl + 1 :], k_orig[b, sl + 1 :]), f"row {b} K tail mutated"
+            assert torch.equal(v_cache[b, sl + 1 :], v_orig[b, sl + 1 :]), f"row {b} V tail mutated"
+
+    torch.testing.assert_close(out, out_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("head_dim", ALL_HEAD_DIMS)
+@pytest.mark.parametrize("batch,capacity,lens", [
+    (1, 64, [0]),
+    (1, 64, [63]),
+    (1, 256, [255]),
+    (1, 1024, [1023]),
+    (1, 1024, [1]),
+    (1, 1024, [512]),
+    (2, 256, [0, 255]),
+    (2, 512, [10, 500]),
+    (2, 64, [63, 0]),
+])
+@pytest.mark.parametrize("nheads,nheads_k", [(4, 4), (8, 2)])
+def test_flash_attn_with_kvcache(
+    head_dim: int,
+    batch: int,
+    capacity: int,
+    lens: Sequence[int],
+    nheads: int,
+    nheads_k: int,
+) -> None:
+    device = _cuda_device()
+    # Lean builds only ship hdim=128.
+    if head_dim != 128 and os.environ.get("FA_PROFILE", "fwd_all") == "lean":
+        pytest.skip("lean profile builds head_dim=128 only")
+    _run_kvcache_case(
+        device,
+        batch=batch,
+        nheads=nheads,
+        nheads_k=nheads_k,
+        head_dim=head_dim,
+        capacity=capacity,
+        cache_lens=lens,
+        num_splits=0,
+    )
+
+
+@pytest.mark.parametrize("num_splits", [1, 2, 4, 8])
+def test_flash_attn_with_kvcache_splits(num_splits: int) -> None:
+    device = _cuda_device()
+    _run_kvcache_case(
+        device,
+        batch=2,
+        nheads=8,
+        nheads_k=2,
+        head_dim=64 if os.environ.get("FA_PROFILE", "fwd_all") != "lean" else 128,
+        capacity=1024,
+        cache_lens=[100, 900],
+        num_splits=num_splits,
+    )
+
+
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
+def test_flash_attn_with_kvcache_lse(num_splits: int) -> None:
+    device = _cuda_device()
+    torch.manual_seed(0)
+    batch, nheads, nheads_k, head_dim = 2, 8, 2, 128
+    capacity, cache_len = 256, 100
+    scale = head_dim ** -0.5
+
+    q = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    k_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_cache = torch.zeros(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_cache = torch.zeros(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_cache.copy_(torch.randn_like(k_cache))
+    v_cache.copy_(torch.randn_like(v_cache))
+    cache_seqlens = torch.full((batch,), cache_len, dtype=torch.int32, device=device)
+
+    out, lse = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=scale,
+        causal=False,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+    )
+
+    assert out.shape == (batch, 1, nheads, head_dim)
+    assert lse.shape == (batch, nheads, 1)
+    assert lse.dtype == torch.float32
+
+    # Caches were appended in place; the valid prefix is cache_len + 1 tokens.
+    k_prefix = k_cache[:, : cache_len + 1]
+    v_prefix = v_cache[:, : cache_len + 1]
+    torch.testing.assert_close(out, _kvcache_reference(q, k_prefix, v_prefix, scale), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, _kvcache_reference_lse(q, k_prefix, scale), atol=2e-2, rtol=2e-2)
+
+
+def test_flash_attn_with_kvcache_int_cache_seqlens() -> None:
+    device = _cuda_device()
+    torch.manual_seed(0)
+    batch, nheads, nheads_k, head_dim = 2, 8, 2, 128
+    capacity, cache_len = 256, 64
+    scale = head_dim ** -0.5
+
+    q = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    k_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_base = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_base = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    seqlens = torch.full((batch,), cache_len, dtype=torch.int32, device=device)
+
+    out_int = flash_attn_with_kvcache(
+        q,
+        k_base.clone(),
+        v_base.clone(),
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_len,
+        softmax_scale=scale,
+        causal=False,
+    )
+    out_tensor = flash_attn_with_kvcache(
+        q,
+        k_base.clone(),
+        v_base.clone(),
+        k=k_new,
+        v=v_new,
+        cache_seqlens=seqlens,
+        softmax_scale=scale,
+        causal=False,
+    )
+    assert torch.equal(out_int, out_tensor)
+
+
+@pytest.mark.parametrize("num_splits", [0, 2])
+def test_flash_attn_with_kvcache_causal_parity(num_splits: int) -> None:
+    """For seqlen_q == 1 causal must be a no-op (official behavior)."""
+    device = _cuda_device()
+    torch.manual_seed(0)
+    batch, nheads, nheads_k, head_dim = 2, 8, 2, 128
+    capacity, cache_len = 256, 100
+    scale = head_dim ** -0.5
+
+    q = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    k_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_new = torch.randn(batch, 1, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_base = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_base = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    seqlens = torch.full((batch,), cache_len, dtype=torch.int32, device=device)
+
+    out_nc = flash_attn_with_kvcache(
+        q,
+        k_base.clone(),
+        v_base.clone(),
+        k=k_new,
+        v=v_new,
+        cache_seqlens=seqlens,
+        softmax_scale=scale,
+        causal=False,
+        num_splits=num_splits,
+    )
+    out_c = flash_attn_with_kvcache(
+        q,
+        k_base.clone(),
+        v_base.clone(),
+        k=k_new,
+        v=v_new,
+        cache_seqlens=seqlens,
+        softmax_scale=scale,
+        causal=True,
+        num_splits=num_splits,
+    )
+    assert torch.equal(out_nc, out_c)
+
+
+def test_flash_attn_with_kvcache_rejects_unsupported_upstream_args() -> None:
+    device = _cuda_device()
+    torch.manual_seed(0)
+    batch, nheads, head_dim = 1, 4, 128
+    q = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    k_new = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    v_new = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    k_cache = torch.zeros(batch, 64, nheads, head_dim, device=device, dtype=torch.float16)
+    v_cache = torch.zeros(batch, 64, nheads, head_dim, device=device, dtype=torch.float16)
+    seqlens = torch.zeros(batch, dtype=torch.int32, device=device)
+
+    common = dict(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=seqlens,
+    )
+
+    with pytest.raises(ValueError, match="rotary"):
+        flash_attn_with_kvcache(**common, rotary_cos=torch.zeros(8, 64, device=device, dtype=torch.float16))
+    with pytest.raises(ValueError, match="rotary"):
+        flash_attn_with_kvcache(**common, rotary_sin=torch.zeros(8, 64, device=device, dtype=torch.float16))
+    with pytest.raises(ValueError, match="cache_batch_idx"):
+        flash_attn_with_kvcache(**common, cache_batch_idx=torch.zeros(batch, dtype=torch.int32, device=device))
+    with pytest.raises(ValueError, match="cache_leftpad"):
+        flash_attn_with_kvcache(**common, cache_leftpad=torch.zeros(batch, dtype=torch.int32, device=device))
+    with pytest.raises(ValueError, match="paged"):
+        flash_attn_with_kvcache(**common, block_table=torch.zeros(batch, 4, dtype=torch.int32, device=device))
+    with pytest.raises(ValueError, match="alibi_slopes"):
+        flash_attn_with_kvcache(**common, alibi_slopes=torch.ones(nheads, device=device, dtype=torch.float16))
+    with pytest.raises(ValueError, match="both be None or both be passed"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=v_new, cache_seqlens=seqlens)
+    with pytest.raises(ValueError, match="both be None or both be passed"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, k=k_new, v=None, cache_seqlens=seqlens)
+    with pytest.raises(ValueError, match="cache_seqlens must be passed"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=None)
+    with pytest.raises(ValueError, match="num_splits"):
+        flash_attn_with_kvcache(**common, num_splits=-1)
+
+
+@pytest.mark.parametrize("head_dim", ALL_HEAD_DIMS)
+@pytest.mark.parametrize("batch,capacity,lens", [
+    (1, 64, [10]),
+    (1, 256, [128]),
+    (1, 1024, [512]),
+    (1, 8192, [7500]),
+    (2, 512, [10, 500]),
+])
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
+def test_flash_attn_with_kvcache_attend_only(
+    head_dim: int, batch: int, capacity: int, lens: Sequence[int], num_splits: int
+) -> None:
+    device = _cuda_device()
+    if head_dim != 128 and os.environ.get("FA_PROFILE", "fwd_all") == "lean":
+        pytest.skip("lean profile builds head_dim=128 only")
+    torch.manual_seed(42)
+    nheads = 8
+    nheads_k = 4
+    scale = head_dim ** -0.5
+
+    q = torch.randn(batch, 1, nheads, head_dim, device=device, dtype=torch.float16)
+    k_cache = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_cache = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    cache_seqlens = torch.tensor(list(lens), dtype=torch.int32, device=device)
+
+    k_orig = k_cache.clone()
+    v_orig = v_cache.clone()
+
+    outs = []
+    lses = []
+    for b, sl in enumerate(lens):
+        kb = k_cache[b : b + 1, :sl]
+        vb = v_cache[b : b + 1, :sl]
+        outs.append(_kvcache_reference(q[b : b + 1], kb, vb, scale))
+        lses.append(_kvcache_reference_lse(q[b : b + 1], kb, scale))
+    out_ref = torch.cat(outs, dim=0)
+    lse_ref = torch.cat(lses, dim=0)
+
+    out, lse = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=scale,
+        causal=False,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+    )
+
+    torch.cuda.synchronize()
+
+    assert torch.equal(k_cache, k_orig), "k_cache was mutated during attend-only mode!"
+    assert torch.equal(v_cache, v_orig), "v_cache was mutated during attend-only mode!"
+
+    torch.testing.assert_close(out, out_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
+
+@pytest.mark.parametrize("head_dim", ALL_HEAD_DIMS)
+@pytest.mark.parametrize("seqlen_q", [1, 2, 4, 8, 64])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
+def test_flash_attn_with_kvcache_multi_token_q(
+    head_dim: int, seqlen_q: int, causal: bool, num_splits: int
+) -> None:
+    device = _cuda_device()
+    if head_dim != 128 and os.environ.get("FA_PROFILE", "full") == "lean":
+        pytest.skip("lean profile builds head_dim=128 only")
+    torch.manual_seed(7)
+    batch = 2
+    nheads = 8
+    nheads_k = 2
+    capacity = 256
+    cache_lens = [32, 96]
+    scale = head_dim ** -0.5
+
+    q = torch.randn(batch, seqlen_q, nheads, head_dim, device=device, dtype=torch.float16)
+    k_new = torch.randn(batch, seqlen_q, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_new = torch.randn(batch, seqlen_q, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_cache = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_cache = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    cache_seqlens = torch.tensor(cache_lens, dtype=torch.int32, device=device)
+
+    k_ref = k_cache.clone()
+    v_ref = v_cache.clone()
+    outs = []
+    for b, sl in enumerate(cache_lens):
+        k_ref[b, sl : sl + seqlen_q] = k_new[b]
+        v_ref[b, sl : sl + seqlen_q] = v_new[b]
+        s = sl + seqlen_q
+        kb = k_ref[b : b + 1, :s]
+        vb = v_ref[b : b + 1, :s]
+        (out_b,) = vanilla_attention_ref(q[b : b + 1], kb, vb, causal=causal, softmax_scale=scale)
+        outs.append(out_b)
+    out_ref = torch.cat(outs, dim=0)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=scale,
+        causal=causal,
+        num_splits=num_splits,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, out_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 256])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (97, 113)])
+@pytest.mark.parametrize("window_size", [(-1, -1), (32, 0), (16, 16)])
+@pytest.mark.parametrize("softcap", [0.0, 30.0])
+@pytest.mark.parametrize("use_alibi", [False, True])
+def test_flash_attn_stage4_features(
+    head_dim: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    window_size: Tuple[int, int],
+    softcap: float,
+    use_alibi: bool,
+) -> None:
+    device = _cuda_device()
+    if head_dim != 128 and os.environ.get("FA_PROFILE", "full") == "lean":
+        pytest.skip("lean profile builds head_dim=128 only")
+    torch.manual_seed(123)
+    batch, nheads, nheads_k = 2, 4, 2
+    scale = head_dim ** -0.5
+    causal = window_size == (32, 0)
+
+    q = torch.randn(batch, seqlen_q, nheads, head_dim, device=device, dtype=torch.float16, requires_grad=True)
+    k = torch.randn(batch, seqlen_k, nheads_k, head_dim, device=device, dtype=torch.float16, requires_grad=True)
+    v = torch.randn(batch, seqlen_k, nheads_k, head_dim, device=device, dtype=torch.float16, requires_grad=True)
+    dout = torch.randn_like(q)
+    alibi_slopes = torch.linspace(0.01, 0.1, nheads, device=device, dtype=torch.float32) if use_alibi else None
+
+    out = flash_attn_func(
+        q, k, v,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+    )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+
+    # Reference in FP32
+    qf = q.detach().float().requires_grad_(True)
+    kf = k.detach().float().requires_grad_(True)
+    vf = v.detach().float().requires_grad_(True)
+    rep = nheads // nheads_k
+    kf_exp = kf.repeat_interleave(rep, dim=2)
+    vf_exp = vf.repeat_interleave(rep, dim=2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", qf, kf_exp) * scale
+    if softcap > 0.0:
+        scores = softcap * torch.tanh(scores / softcap)
+    q_idx = torch.arange(seqlen_q, device=device)[:, None]
+    k_idx = torch.arange(seqlen_k, device=device)[None, :]
+    rel = k_idx - q_idx - (seqlen_k - seqlen_q)
+    if alibi_slopes is not None:
+        scores = scores + alibi_slopes[None, :, None, None] * rel[None, None, :, :]
+    w_left, w_right = window_size[0], (0 if causal else window_size[1])
+    mask = torch.ones((seqlen_q, seqlen_k), dtype=torch.bool, device=device)
+    if causal or w_right >= 0:
+        mask = mask & (rel <= w_right)
+    if w_left >= 0:
+        mask = mask & (rel >= -w_left)
+    scores = scores.masked_fill(~mask[None, None, :, :], float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    probs = torch.where(mask[None, None, :, :].any(dim=-1, keepdim=True), probs, torch.zeros_like(probs))
+    out_ref = torch.einsum("bhqk,bkhd->bqhd", probs, vf_exp).half()
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref.float(), (qf, kf, vf), dout.float())
+
+    torch.testing.assert_close(out, out_ref, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(dq, dq_ref.half(), atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(dk, dk_ref.half(), atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(dv, dv_ref.half(), atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize("head_dim", [32, 128, 256])
+@pytest.mark.parametrize("window_size", [(-1, -1), (32, 0), (16, 16)])
+@pytest.mark.parametrize("softcap", [0.0, 30.0])
+@pytest.mark.parametrize("use_alibi", [False, True])
+def test_flash_attn_varlen_stage4_features(
+    head_dim: int,
+    window_size: Tuple[int, int],
+    softcap: float,
+    use_alibi: bool,
+) -> None:
+    device = _cuda_device()
+    if head_dim != 128 and os.environ.get("FA_PROFILE", "full") == "lean":
+        pytest.skip("lean profile builds head_dim=128 only")
+    torch.manual_seed(456)
+    seqlens_q = [73, 129]
+    seqlens_k = [85, 111]
+    nheads, nheads_k = 4, 2
+    scale = head_dim ** -0.5
+    causal = window_size == (32, 0)
+
+    cu_q = torch.tensor([0, seqlens_q[0], sum(seqlens_q)], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, seqlens_k[0], sum(seqlens_k)], dtype=torch.int32, device=device)
+    q = torch.randn(sum(seqlens_q), nheads, head_dim, device=device, dtype=torch.float16, requires_grad=True)
+    k = torch.randn(sum(seqlens_k), nheads_k, head_dim, device=device, dtype=torch.float16, requires_grad=True)
+    v = torch.randn(sum(seqlens_k), nheads_k, head_dim, device=device, dtype=torch.float16, requires_grad=True)
+    dout = torch.randn_like(q)
+    alibi_slopes = torch.linspace(0.01, 0.1, nheads, device=device, dtype=torch.float32) if use_alibi else None
+
+    out = flash_attn_varlen_func(
+        q, k, v,
+        cu_q, cu_k,
+        max(seqlens_q), max(seqlens_k),
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+    )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+
+    outs_ref, dqs_ref, dks_ref, dvs_ref = [], [], [], []
+    rep = nheads // nheads_k
+    w_left, w_right = window_size[0], (0 if causal else window_size[1])
+    q_off, k_off = 0, 0
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        qf = q[q_off : q_off + sq].detach().float().requires_grad_(True)
+        kf = k[k_off : k_off + sk].detach().float().requires_grad_(True)
+        vf = v[k_off : k_off + sk].detach().float().requires_grad_(True)
+        dof = dout[q_off : q_off + sq].detach().float()
+        kf_exp = kf.repeat_interleave(rep, dim=1)
+        vf_exp = vf.repeat_interleave(rep, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", qf, kf_exp) * scale
+        if softcap > 0.0:
+            scores = softcap * torch.tanh(scores / softcap)
+        q_idx = torch.arange(sq, device=device)[:, None]
+        k_idx = torch.arange(sk, device=device)[None, :]
+        rel = k_idx - q_idx - (sk - sq)
+        if alibi_slopes is not None:
+            scores = scores + alibi_slopes[:, None, None] * rel[None, :, :]
+        mask = torch.ones((sq, sk), dtype=torch.bool, device=device)
+        if causal or w_right >= 0:
+            mask = mask & (rel <= w_right)
+        if w_left >= 0:
+            mask = mask & (rel >= -w_left)
+        scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        probs = torch.where(mask[None, :, :].any(dim=-1, keepdim=True), probs, torch.zeros_like(probs))
+        out_b = torch.einsum("hqk,khd->qhd", probs, vf_exp)
+        dq_b, dk_b, dv_b = torch.autograd.grad(out_b, (qf, kf, vf), dof)
+        outs_ref.append(out_b.half())
+        dqs_ref.append(dq_b.half())
+        dks_ref.append(dk_b.half())
+        dvs_ref.append(dv_b.half())
+        q_off += sq
+        k_off += sk
+
+    torch.testing.assert_close(out, torch.cat(outs_ref, dim=0), atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(dq, torch.cat(dqs_ref, dim=0), atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(dk, torch.cat(dks_ref, dim=0), atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(dv, torch.cat(dvs_ref, dim=0), atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize("head_dim", [32, 128, 256])
+@pytest.mark.parametrize("window_size", [(-1, -1), (32, 0), (16, 16)])
+@pytest.mark.parametrize("softcap", [0.0, 30.0])
+@pytest.mark.parametrize("use_alibi", [False, True])
+@pytest.mark.parametrize("num_splits", [1, 2])
+def test_flash_attn_with_kvcache_stage4_features(
+    head_dim: int,
+    window_size: Tuple[int, int],
+    softcap: float,
+    use_alibi: bool,
+    num_splits: int,
+) -> None:
+    device = _cuda_device()
+    if head_dim != 128 and os.environ.get("FA_PROFILE", "full") == "lean":
+        pytest.skip("lean profile builds head_dim=128 only")
+    torch.manual_seed(789)
+    batch, seqlen_q, nheads, nheads_k, capacity = 2, 4, 8, 2, 256
+    cache_lens = [40, 100]
+    scale = head_dim ** -0.5
+    causal = window_size == (32, 0)
+
+    q = torch.randn(batch, seqlen_q, nheads, head_dim, device=device, dtype=torch.float16)
+    k_new = torch.randn(batch, seqlen_q, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_new = torch.randn(batch, seqlen_q, nheads_k, head_dim, device=device, dtype=torch.float16)
+    k_cache = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    v_cache = torch.randn(batch, capacity, nheads_k, head_dim, device=device, dtype=torch.float16)
+    cache_seqlens = torch.tensor(cache_lens, dtype=torch.int32, device=device)
+    alibi_slopes = torch.linspace(0.01, 0.1, nheads, device=device, dtype=torch.float32) if use_alibi else None
+
+    k_ref = k_cache.clone()
+    v_ref = v_cache.clone()
+    outs = []
+    rep = nheads // nheads_k
+    w_left, w_right = window_size[0], (0 if causal else window_size[1])
+    for b, sl in enumerate(cache_lens):
+        k_ref[b, sl : sl + seqlen_q] = k_new[b]
+        v_ref[b, sl : sl + seqlen_q] = v_new[b]
+        sk = sl + seqlen_q
+        qf = q[b].float()
+        kf = k_ref[b, :sk].float().repeat_interleave(rep, dim=1)
+        vf = v_ref[b, :sk].float().repeat_interleave(rep, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", qf, kf) * scale
+        if softcap > 0.0:
+            scores = softcap * torch.tanh(scores / softcap)
+        q_idx = torch.arange(seqlen_q, device=device)[:, None]
+        k_idx = torch.arange(sk, device=device)[None, :]
+        rel = k_idx - q_idx - (sk - seqlen_q)
+        if alibi_slopes is not None:
+            scores = scores + alibi_slopes[:, None, None] * rel[None, :, :]
+        mask = torch.ones((seqlen_q, sk), dtype=torch.bool, device=device)
+        if causal or w_right >= 0:
+            mask = mask & (rel <= w_right)
+        if w_left >= 0:
+            mask = mask & (rel >= -w_left)
+        scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        probs = torch.where(mask[None, :, :].any(dim=-1, keepdim=True), probs, torch.zeros_like(probs))
+        outs.append(torch.einsum("hqk,khd->qhd", probs, vf).half().unsqueeze(0))
+    out_ref = torch.cat(outs, dim=0)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        num_splits=num_splits,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, out_ref, atol=2e-2, rtol=2e-2)

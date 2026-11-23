@@ -1,9 +1,7 @@
-#include <iostream>
 #include <cstdlib>
 #include <cstdio>
 #include <cassert>
 #include <float.h>
-#include <torch/extension.h>
 #include <cute/tensor.hpp>
 
 #include <cutlass/array.h>
@@ -19,75 +17,61 @@
 using namespace cute;
 
 
-// for some reason changing this into params struct is 15% slower for hdim = 128
 template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
-inline __device__ void compute_attn_1rowblock(
-                          const half_t* __restrict__ q,
-                          const half_t* __restrict__ k,
-                          const half_t* __restrict__ v,
-                          half_t* __restrict__ o,
-                          float* __restrict__ l,
-                          const int* __restrict__ cu_seqlens_q,
-                          const int* __restrict__ cu_seqlens_k,
-                          const int batch_size,
-                          const int max_seqlen_q,
-                          const int max_seqlen_k,
-                          const int num_heads,
-                          const int num_heads_k,
-                          const int h_h_k_ratio,
-                          const int head_dim,
-                          const float softmax_scale,
-                          const int is_casual,
-                          const int bidb,
-                          const int bidh,
-                          const int m_block)
+inline __device__ void compute_attn_1rowblock(const Flash_fwd_params &params,
+                                              const int bidb,
+                                              const int bidh,
+                                              const int m_block)
 {
-
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
+    const half_t* __restrict__ q = params.q_ptr;
+    const half_t* __restrict__ k = params.k_ptr;
+    const half_t* __restrict__ v = params.v_ptr;
+    half_t* __restrict__ o = params.o_ptr;
+    float* __restrict__ l = params.l_ptr;
+    const int batch_size = params.b;
+    const int max_seqlen_q = params.seqlen_q;
+    const int num_heads = params.h;
+    const int num_heads_k = params.h_k;
+    const int h_h_k_ratio = params.h_h_k_ratio;
+    const int head_dim = params.d;
+    const float scale_softmax_log2 = params.scale_softmax_log2;
 
-    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(max_seqlen_q, max_seqlen_k, bidb, cu_seqlens_q, cu_seqlens_k);
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     const int seqlen_q = binfo.actual_seqlen_q;
     const int seqlen_k = binfo.actual_seqlen_k;
-
 
     if (m_block * kBlockM >= seqlen_q) {
         return;
     }
 
-
-    Tensor mQ = make_tensor(make_gmem_ptr(q + binfo.q_offset(num_heads * head_dim, bidb)),
+    Tensor mQ = make_tensor(make_gmem_ptr(q + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(seqlen_q, num_heads, head_dim),
-                            make_stride(num_heads * head_dim, head_dim, Int<1>{}));
+                            make_stride(params.q_row_stride, params.q_head_stride, Int<1>{}));
 
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));
 
-
-
-
-    Tensor mK = make_tensor(make_gmem_ptr(k + binfo.k_offset(num_heads_k * head_dim, bidb)),
+    Tensor mK = make_tensor(make_gmem_ptr(k + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
                             make_shape(seqlen_k, num_heads_k, head_dim),
-                            make_stride(num_heads_k * head_dim, head_dim, Int<1>{}));
+                            make_stride(params.k_row_stride, params.k_head_stride, Int<1>{}));
 
     Tensor gK = local_tile(mK(_, bidh / h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));
 
-
-
-    Tensor mV = make_tensor(make_gmem_ptr(v + binfo.k_offset(num_heads_k * head_dim, bidb)),
+    Tensor mV = make_tensor(make_gmem_ptr(v + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
                             make_shape(seqlen_k, num_heads_k, head_dim),
-                            make_stride(num_heads_k * head_dim, head_dim, Int<1>{}));
+                            make_stride(params.v_row_stride, params.v_head_stride, Int<1>{}));
 
     Tensor gV = local_tile(mV(_, bidh / h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));
 
-
-    Tensor mO = make_tensor(make_gmem_ptr(o + binfo.q_offset(num_heads * head_dim, bidb)),
+    Tensor mO = make_tensor(make_gmem_ptr(o + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
                             make_shape(seqlen_q, num_heads, head_dim),
-                            make_stride(num_heads * head_dim, head_dim, Int<1>{}));
+                            make_stride(params.o_row_stride, params.o_head_stride, Int<1>{}));
 
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));
@@ -105,8 +89,9 @@ inline __device__ void compute_attn_1rowblock(
     extern __shared__ char smem_[];
 
 
+    constexpr bool kShareQK = (kHeadDim == 256);
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + kBlockM*kHeadDim, typename Kernel_traits::SmemLayoutK{});
+    Tensor sK = make_tensor(sQ.data() + (kShareQK ? 0 : kBlockM * kHeadDim), typename Kernel_traits::SmemLayoutK{});
     Tensor sV = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutV{});
     Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVTransposed{});
     Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
@@ -166,7 +151,6 @@ inline __device__ void compute_attn_1rowblock(
     ThrCopy thr_copy_V = gmem_tiled_copy_V.get_slice(threadIdx.x);
     Tensor tVgV = thr_copy_V.partition_S(gV);
     Tensor tVsV = thr_copy_V.partition_D(sV);
-    Tensor tVrV = make_fragment_like(tVsV);
 
     // smem -> gmem for O
     ThrCopy thr_copy_O = gmem_tiled_copy_O.get_slice(threadIdx.x);
@@ -220,31 +204,60 @@ inline __device__ void compute_attn_1rowblock(
     auto tOsV_copy_view = s2r_thr_copy_V.partition_S(sVt);
     auto tOrV_copy_view = s2r_thr_copy_V.retile_D(tOrV);
 
-    const int n_block_min = 0;
-    int m_block_max = ceil_div(seqlen_q, kBlockM);
+    const int window_size_left = params.window_size_left;
+    const int window_size_right = Is_causal ? 0 : params.window_size_right;
+    const bool has_local = (window_size_left >= 0) || (window_size_right >= 0);
+    const float softcap = params.softcap;
+    const float alibi_slope = (params.alibi_slopes_ptr == nullptr)
+        ? 0.0f
+        : params.alibi_slopes_ptr[bidb * params.alibi_slopes_batch_stride + bidh];
+    const bool has_alibi = (alibi_slope != 0.0f);
+
+    int n_block_min = 0;
     int n_block_max = ceil_div(seqlen_k, kBlockN);
 
+    if (Is_causal || window_size_right >= 0) {
+        const int max_col = (m_block + 1) * kBlockM + seqlen_k - seqlen_q + window_size_right;
+        n_block_max = min(n_block_max, (max_col <= 0) ? 0 : ceil_div(max_col, kBlockN));
+    }
+    if (window_size_left >= 0) {
+        const int min_col = m_block * kBlockM + seqlen_k - seqlen_q - window_size_left;
+        n_block_min = max(0, min_col / kBlockN);
+    }
 
-    int n_masking_steps = (!Is_causal)
-        ? 1
-        : ((Is_even_MN && Is_causal) ? ceil_div(kBlockM, kBlockN) : ceil_div(kBlockM, kBlockN) + 1);
+    int n_masking_steps = (has_local || has_alibi)
+        ? max(0, n_block_max - n_block_min)
+        : ((!Is_causal)
+            ? 1
+            : ((Is_even_MN && Is_causal) ? ceil_div(kBlockM, kBlockN) : ceil_div(kBlockM, kBlockN) + 1));
+    n_masking_steps = min(n_masking_steps, max(0, n_block_max - n_block_min));
 
     int causal_offset = 0;
     int is_even_mn_offset = 0;
 
-    if constexpr(Is_causal) {
+    // If this m_block has zero active key blocks, zero O and set L = -inf
+    if (n_block_max <= n_block_min) {
+        clear(tOrO_float);
+        Tensor tOrO = convert_type<half_t>(tOrO_float);
+        copy(tOrO, tOsO);
+        __syncthreads();
+        masked_copy<Is_even_MN>(
+            gmem_tiled_copy_O, tOsO_copy, tOgO_copy, tCqO,
+            seqlen_q - m_block * kBlockM,
+            /*clear_D=*/false);
+        if (l != nullptr && lane_id % 4 == 0) {
+            if (global_row_offset + thread_row < seqlen_q) {
+                gL[thread_row] = -INFINITY;
+            }
+            if (global_row_offset + thread_row + 8 < seqlen_q) {
+                gL[thread_row + 8] = -INFINITY;
+            }
+        }
+        return;
+    }
 
-        n_block_max = fmaxf(0, ceil_div((m_block + 1) * kBlockM + seqlen_k - seqlen_q, kBlockN));
-        n_masking_steps = fminf(n_masking_steps, n_block_max);
-
-        causal_offset = seqlen_k - seqlen_q - (n_block_max - 1) * kBlockN + m_block * kBlockM;         
-
-    }        
-
+    causal_offset = seqlen_k - seqlen_q - (n_block_max - 1) * kBlockN + m_block * kBlockM;
     is_even_mn_offset = seqlen_k - (n_block_max - 1) * kBlockN;
-    
-    // if seqlen_q > seqlen_k we exit early for the blocks with rows that are fully masked
-    if (n_block_max == 0) {return;}
 
     auto QK_BLOCK_MAX = size<2>(tSsK);
     auto PV_BLOCK_MAX = size<2>(tOsV);
@@ -259,6 +272,14 @@ inline __device__ void compute_attn_1rowblock(
         gmem_tiled_copy_QK, tQgQ, tQsQ, tCqQ, 
         seqlen_q - m_block * kBlockM, 
         /*clear_D=*/true);
+    if constexpr (kShareQK) {
+        __syncthreads();
+        CUTE_UNROLL
+        for (int qk_block = 0; qk_block < QK_BLOCK_MAX; qk_block++) {
+            copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
+        }
+        __syncthreads();
+    }
 
 
 
@@ -267,7 +288,7 @@ inline __device__ void compute_attn_1rowblock(
 
     // these are the blocks that need masking
     
-    Mask<Is_causal> accum_s_mask(seqlen_q, seqlen_k);
+    Mask<Is_causal> accum_s_mask(seqlen_q, seqlen_k, window_size_left, window_size_right, alibi_slope);
     // constexpr bool Is_even_MN = true; 
 
     masked_copy<Is_even_MN>(
@@ -299,7 +320,9 @@ inline __device__ void compute_attn_1rowblock(
 
         CUTE_UNROLL
         for (int qk_block = 0; qk_block < QK_BLOCK_MAX; qk_block++) {
-            copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
+            if constexpr (!kShareQK) {
+                copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
+            }
             copy(s2r_tiled_copy_K, tSsK_copy_view(_,_,qk_block), tSrK_copy_view(_,_,qk_block));
 
             gemm(tiled_mma, tSrQ(_,_,qk_block), tSrK(_,_,qk_block), tSrS_float);
@@ -308,7 +331,7 @@ inline __device__ void compute_attn_1rowblock(
 
         __syncthreads();
         masked_copy<Is_even_MN>(
-            gmem_tiled_copy_QK, tVgV(_,_,_,n_block), tVsV, tCqK, 
+            gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVsV, tCqK,
             seqlen_k - n_block * kBlockN,
             /*clear_D=*/true);
 
@@ -317,8 +340,16 @@ inline __device__ void compute_attn_1rowblock(
 
 
         // for now we rescale before we apply causal mask
-        for (int i=0;i< tSrS_float.size();i ++ ) {
-            tSrS_float[i] *= softmax_scale;
+        if (softcap > 0.0f) {
+            const float inv_softcap = params.softmax_scale / softcap;
+            const float softcap_log2 = softcap * float(M_LOG2E);
+            for (int i = 0; i < tSrS_float.size(); i++) {
+                tSrS_float[i] = softcap_log2 * tanhf(tSrS_float[i] * inv_softcap);
+            }
+        } else {
+            for (int i = 0; i < tSrS_float.size(); i++) {
+                tSrS_float[i] *= scale_softmax_log2;
+            }
         }
 
    
@@ -370,7 +401,7 @@ inline __device__ void compute_attn_1rowblock(
                 if (rM[i] == -FLT_MAX) {
                     tSrS_float(make_coord(_,i),_,_)[j] = 0.0f;
                 } else {
-                    tSrS_float(make_coord(_,i),_,_)[j] = expf(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
+                    tSrS_float(make_coord(_,i),_,_)[j] = (tSrS_float(make_coord(_,i),_,_)[j] == -FLT_MAX) ? 0.0f : exp2f(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
                 }
 
             }
@@ -380,7 +411,7 @@ inline __device__ void compute_attn_1rowblock(
 
         // rescale l and also reset rD to 0
         for (int i =0; i<2; i++) {
-            rL[i] = expf(rM_old[i] - rM[i]) * rL_old[i];
+            rL[i] = exp2f(rM_old[i] - rM[i]) * rL_old[i];
             rD[i] = 0.0f;
         }
         // compute sum(sP)
@@ -425,7 +456,7 @@ inline __device__ void compute_attn_1rowblock(
 
         for (int i =0; i<2; i++) {
             for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
-                tOrO_float(make_coord(_,i),_,_)[j] = expf(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
+                tOrO_float(make_coord(_,i),_,_)[j] = exp2f(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
             }
         }
 
@@ -479,7 +510,9 @@ inline __device__ void compute_attn_1rowblock(
 
         CUTE_UNROLL
         for (int qk_block = 0; qk_block < QK_BLOCK_MAX; qk_block++) {
-            copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
+            if constexpr (!kShareQK) {
+                copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
+            }
             copy(s2r_tiled_copy_K, tSsK_copy_view(_,_,qk_block), tSrK_copy_view(_,_,qk_block));
 
             gemm(tiled_mma, tSrQ(_,_,qk_block), tSrK(_,_,qk_block), tSrS_float);
@@ -492,8 +525,16 @@ inline __device__ void compute_attn_1rowblock(
 
 
 
-        for (int i=0;i< tSrS_float.size();i ++ ) {
-            tSrS_float[i] *= softmax_scale;
+        if (softcap > 0.0f) {
+            const float inv_softcap = params.softmax_scale / softcap;
+            const float softcap_log2 = softcap * float(M_LOG2E);
+            for (int i = 0; i < tSrS_float.size(); i++) {
+                tSrS_float[i] = softcap_log2 * tanhf(tSrS_float[i] * inv_softcap);
+            }
+        } else {
+            for (int i = 0; i < tSrS_float.size(); i++) {
+                tSrS_float[i] *= scale_softmax_log2;
+            }
         }
 
 
@@ -534,12 +575,12 @@ inline __device__ void compute_attn_1rowblock(
             //float max_scaled = rM[i] * float(M_LOG2E);
             CUTE_UNROLL
             for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
-                tSrS_float(make_coord(_,i),_,_)[j] = expf(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
+                tSrS_float(make_coord(_,i),_,_)[j] = (tSrS_float(make_coord(_,i),_,_)[j] == -FLT_MAX) ? 0.0f : exp2f(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
                 // using FMA instructions inside exp is slower
                 //tSrS_float(make_coord(_,i),_,_)[j] = exp2f(tSrS_float(make_coord(_,i),_,_)[j] * float(M_LOG2E) - max_scaled);
             }
             
-            rL[i] = expf(rM_old[i] - rM[i]) * rL_old[i];
+            rL[i] = exp2f(rM_old[i] - rM[i]) * rL_old[i];
             // rL[i] = exp2f(rM_old[i] * float(M_LOG2E) - max_scaled) * rL_old[i];
             rD[i] = 0.0f;
         }
@@ -586,9 +627,10 @@ inline __device__ void compute_attn_1rowblock(
 
         // rescale O
 
-        for (int i =0; i<2; i++) {
-            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
-                tOrO_float(make_coord(_,i),_,_)[j] = expf(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
+        for (int i = 0; i < 2; i++) {
+            const float rescale = exp2f(rM_old[i] - rM[i]);
+            for (int j = 0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
+                tOrO_float(make_coord(_,i),_,_)[j] *= rescale;
             }
         }
 
@@ -648,68 +690,23 @@ inline __device__ void compute_attn_1rowblock(
         /*clear_D=*/false);
 
 
-    if (global_row_offset + thread_row < seqlen_q) {
-        if (rL[0] == 0.0f) {
-            gL[thread_row] = 0.0f;
-        } else {
-            gL[thread_row] = rM[0] + logf(rL[0]);
+    if (l != nullptr && lane_id % 4 == 0) {
+        if (global_row_offset + thread_row < seqlen_q) {
+            gL[thread_row] = (rL[0] == 0.0f) ? -INFINITY : (rM[0] * float(M_LN2) + logf(rL[0]));
         }
-
-
-    }
-    if (global_row_offset + thread_row + 8 < seqlen_q) {
-
-        if (rL[1] == 0.0f) {
-            gL[thread_row + 8] = 0.0f;
-        } else {
-            gL[thread_row + 8] = rM[1] + logf(rL[1]);
+        if (global_row_offset + thread_row + 8 < seqlen_q) {
+            gL[thread_row + 8] = (rL[1] == 0.0f) ? -INFINITY : (rM[1] * float(M_LN2) + logf(rL[1]));
         }
-
     }
 
 }
 
 
 template<typename Kernel_traits, bool Is_causal, bool Is_even_MN>
-inline __device__ void compute_attn(half_t* __restrict__ q,
-                                      half_t* __restrict__ k,
-                                      half_t* __restrict__ v,
-                                      half_t* __restrict__ o,
-                                      float* __restrict__ l,
-                                      int* __restrict__ cu_seqlens_q,
-                                      int* __restrict__ cu_seqlens_k,
-                                      int batch_size,
-                                      int seqlen_q,
-                                      int seqlen_k,
-                                      int num_heads,
-                                      int num_heads_k,
-                                      int h_h_k_ratio,
-                                      int head_dim,
-                                      float softmax_scale,
-                                      int is_casual) {
+inline __device__ void compute_attn(const Flash_fwd_params &params) {
     const int m_block = blockIdx.x;
-    // The block index for the batch.
     const int bidb = blockIdx.y;
-    // The block index for the head.
     const int bidh = blockIdx.z;
 
-    compute_attn_1rowblock<Kernel_traits, Is_causal, Is_even_MN>(q,
-                                                    k,
-                                                    v,
-                                                    o,
-                                                    l,
-                                                    cu_seqlens_q,
-                                                    cu_seqlens_k,
-                                                    batch_size,
-                                                    seqlen_q,
-                                                    seqlen_k,
-                                                    num_heads,
-                                                    num_heads_k,
-                                                    h_h_k_ratio,
-                                                    head_dim,
-                                                    softmax_scale,
-                                                    is_casual,
-                                                    bidb,
-                                                    bidh,
-                                                    m_block);
+    compute_attn_1rowblock<Kernel_traits, Is_causal, Is_even_MN>(params, bidb, bidh, m_block);
 }

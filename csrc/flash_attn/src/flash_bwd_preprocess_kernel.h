@@ -1,11 +1,9 @@
 #pragma once
 
-#include <iostream>
 #include <cstdlib>
 #include <cstdio>
 #include <cassert>
 #include <float.h>
-#include <torch/extension.h>
 #include <cute/tensor.hpp>
 
 #include <cutlass/array.h>
@@ -13,86 +11,69 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include "flash.h"
 #include "kernel_traits.h"
 #include "utils.h"
 #include "block_info.h"
 
-
 using namespace cute;
 
 template <typename Kernel_traits, bool Is_causal>
-inline __device__ void compute_dot_do_o(half_t* o_ptr,
-                      half_t* do_ptr,
-                      float*  d_ptr,
-                      int* cu_seqlens_q,
-                      int batch_size, int seqlen_q, int num_heads, int head_dim, int is_causal)
+inline __device__ void compute_dot_do_o(const Flash_bwd_params &params)
 {
-    // o_offset: (batch_size, seqlen_q, num_heads, head_dim)
-    // do_offset: (batch_size, seqlen_q, num_heads, head_dim)
-    // d_offset: (batch_size, num_heads, seqlen_q)
+    half_t rdO[8];
+    half_t rO[8];
+    float sum = 0.0f;
 
-
-    // block x = batch_size
-    // block y = num_heads
-    // block z = seqlen_q / 32
-
-    // each thread loads 4 elements from do and o if head_dim = 128
-    // 2 elements if head_dim = 64
-
-    half_t rdO[4];
-    half_t rO[4];
-    float sum = 0;
-
-    //int thread_id = threadIdx.x;
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
 
     const int bidb = blockIdx.x;
-    const int max_seqlen_q = seqlen_q;
-    const BlockInfo binfo(max_seqlen_q, max_seqlen_q, bidb, cu_seqlens_q, cu_seqlens_q);
+    const int bidh = blockIdx.y;
+    const int row_block = blockIdx.z;
+    const int max_seqlen_q = params.seqlen_q;
+    const int num_heads = params.h;
+
+    const BlockInfo binfo(params, bidb);
     const int actual_seqlen_q = binfo.actual_seqlen_q;
 
-    int do_o_offset = binfo.q_offset(num_heads * head_dim, bidb) + blockIdx.z * 32 * num_heads * head_dim + blockIdx.y * head_dim;
-    int d_offset = bidb * num_heads * max_seqlen_q + blockIdx.y * max_seqlen_q + blockIdx.z * 32;
-
-    // each threadblock computes a 32 x headdim block
-    // each warp computes a single row
-    // for headdim = 64, each thread computes 2 elements
-    // for headdim = 128, each thread computes 4 elements
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    int elements_per_thread = 0;
-    if constexpr (kHeadDim == 64) {
-        elements_per_thread = 2;
-    } else if constexpr (kHeadDim == 96) {
-        elements_per_thread = 3;
-    } else {
-        elements_per_thread = 4;
-    }
+    constexpr int elements_per_thread = kHeadDim / 32;
 
+    const int thread_row = warp_id;
+    const int thread_col = lane_id * elements_per_thread;
+    const int global_row = row_block * 32 + thread_row;
 
-    int thread_row = warp_id;
-    int thread_col = lane_id * elements_per_thread;
+    const int64_t d_offset = (int64_t(bidb) * num_heads + bidh) * max_seqlen_q + row_block * 32;
 
-    if (blockIdx.z * 32 + thread_row < actual_seqlen_q) {
-        for (int i=0;i<elements_per_thread;i++) {
-            rO[i] = o_ptr[do_o_offset + thread_row * num_heads * head_dim + thread_col + i];
-            rdO[i] = do_ptr[do_o_offset + thread_row * num_heads * head_dim + thread_col + i];
+    if (global_row < actual_seqlen_q) {
+        const int64_t o_offset = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
+                               + int64_t(global_row) * params.o_row_stride
+                               + int64_t(bidh) * params.o_head_stride;
+        const int64_t do_offset = binfo.q_offset(params.do_batch_stride, params.do_row_stride, bidb)
+                                + int64_t(global_row) * params.do_row_stride
+                                + int64_t(bidh) * params.do_head_stride;
+
+        #pragma unroll
+        for (int i = 0; i < elements_per_thread; i++) {
+            rO[i] = params.o_ptr[o_offset + thread_col + i];
+            rdO[i] = params.do_ptr[do_offset + thread_col + i];
         }
 
-        // thread reduction
-        for (int i=0;i<elements_per_thread;i ++) {
+        #pragma unroll
+        for (int i = 0; i < elements_per_thread; i++) {
             sum += static_cast<float>(rO[i]) * static_cast<float>(rdO[i]);
-
         }
 
-
-        // warp reduction
+        #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
-                sum += __shfl_down_sync(0xffffffff, sum, offset);
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
         }
 
         if (lane_id == 0) {
-           d_ptr[d_offset + thread_row] = sum;
+            params.do_o_ptr[d_offset + thread_row] = sum;
         }
+    } else if (global_row < max_seqlen_q && lane_id == 0) {
+        params.do_o_ptr[d_offset + thread_row] = 0.0f;
     }
 }

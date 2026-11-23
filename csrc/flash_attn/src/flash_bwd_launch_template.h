@@ -1,4 +1,3 @@
-
 #pragma once
 #include "flash.h"
 #include "flash_bwd_kernel.h"
@@ -7,144 +6,76 @@
 #include <cutlass/numeric_types.h>
 using half_t = cutlass::half_t;
 
-
 template<typename Kernel_traits, bool Is_causal>
-__global__ void flash_bwd_dot_do_o_kernel(half_t* o_ptr,
-                                            half_t* do_ptr,
-                                            float*  d_ptr,
-                                            int* cu_seqlens_q,
-                                            int batch_size, int seqlen_q, int num_heads, int head_dim, int is_causal) {
-    compute_dot_do_o<Kernel_traits, Is_causal>(o_ptr,
-                                    do_ptr,
-                                    d_ptr,
-                                    cu_seqlens_q,
-                                    batch_size, seqlen_q, num_heads, head_dim, is_causal);
+__global__ void flash_bwd_dot_do_o_kernel(const Flash_bwd_params params) {
+    compute_dot_do_o<Kernel_traits, Is_causal>(params);
 }
-
-
 
 template<typename Kernel_traits, bool Is_causal, bool Is_even_MN>
 __global__ __launch_bounds__(256, 1)
-void flash_bwd_dq_kernel(
-    half_t * __restrict__ q_ptr,
-    half_t * __restrict__ k_ptr,
-    half_t * __restrict__ v_ptr,
-    float * __restrict__ l_ptr,
-    float * __restrict__ d_ptr,
-    half_t * __restrict__ do_ptr,
-    half_t * __restrict__ dq_ptr,
-    int * __restrict__ cu_seqlens_q,
-    int * __restrict__ cu_seqlens_k,
-    int batch_size, int seqlen_q, int seqlen_k, int num_heads, int num_heads_k, int h_h_k_ratio, int head_dim, float softmax_scale, int is_causal) {
-
-        compute_dq<Kernel_traits, Is_causal, Is_even_MN>(q_ptr, k_ptr, v_ptr, l_ptr, d_ptr, do_ptr, dq_ptr, cu_seqlens_q, cu_seqlens_k,
-        batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k, h_h_k_ratio, head_dim, softmax_scale, is_causal);
-
+void flash_bwd_dq_kernel(const Flash_bwd_params params) {
+    compute_dq<Kernel_traits, Is_causal, Is_even_MN>(params);
 }
-
-
 
 template<typename Kernel_traits, bool Is_causal, bool Is_even_MN>
 __global__ __launch_bounds__(256, 1)
-void flash_bwd_dk_dv_kernel(
-    half_t * __restrict__ q_ptr,
-    half_t * __restrict__ k_ptr,
-    half_t * __restrict__ v_ptr,
-    float * __restrict__ l_ptr,
-    float * __restrict__ d_ptr,
-    half_t * __restrict__ do_ptr,
-    half_t* __restrict__ dk_ptr,
-    half_t* __restrict__ dv_ptr,
-    int * __restrict__ cu_seqlens_q,
-    int * __restrict__ cu_seqlens_k,
-    int batch_size, int seqlen_q, int seqlen_k, int num_heads, int num_heads_k, int h_h_k_ratio, int head_dim, float softmax_scale, int is_causal){
-        compute_dk_dv<Kernel_traits, Is_causal, Is_even_MN>(q_ptr, k_ptr, v_ptr, l_ptr, d_ptr, do_ptr, dk_ptr, dv_ptr, cu_seqlens_q, cu_seqlens_k,
-        batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k, h_h_k_ratio, head_dim, softmax_scale, is_causal);
-
+void flash_bwd_dk_dv_kernel(const Flash_bwd_params params) {
+    compute_dk_dv<Kernel_traits, Is_causal, Is_even_MN>(params);
 }
-
-
-
 
 template<typename Kernel_traits, bool Is_causal>
 void run_flash_bwd(Flash_bwd_params &params) {
-
-
-    //auto kernel = flash_bwd_kernel<Kernel_traits, Is_causal>;
+    normalize_bwd_params(params);
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     const bool is_even_MN  = params.cu_seqlens_q == nullptr &&
+                             params.cu_seqlens_k == nullptr &&
                              params.seqlen_q % kBlockM == 0 &&
                              params.seqlen_k % kBlockN == 0;
-    // compute dO \circ O
-    // we use 1 warp to compute a single row
-    // each thread block we launch 1024 = 32 x 32 threads = 32 warps
-    // so each thread block process 32 rows
+    cudaStream_t stream = params.stream;
+
+    // 1. Preprocess: D = rowsum(dO \circ O)
     dim3 dimGrid_dot_do_o(params.b, params.h, (params.seqlen_q + 32 - 1) / 32);
     dim3 dimBlock_dot_do_o(1024);
-    flash_bwd_dot_do_o_kernel<Kernel_traits, Is_causal><<<dimGrid_dot_do_o, dimBlock_dot_do_o>>>(params.o_ptr,
-                    params.do_ptr,
-                    params.do_o_ptr,
-                    params.cu_seqlens_q,
-                    params.b, params.seqlen_q, params.h, params.d, params.is_causal);
+    flash_bwd_dot_do_o_kernel<Kernel_traits, Is_causal><<<dimGrid_dot_do_o, dimBlock_dot_do_o, 0, stream>>>(params);
 
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    const int slot0_elems = (kHeadDim >= 128)
+        ? (kBlockM * kHeadDim)
+        : ((kBlockM + kBlockN) * kHeadDim);
+    const int slot1_pds = 2 * kBlockM * kBlockN;
+    const int slot1_elems = (kHeadDim >= 128)
+        ? ((kBlockM * kHeadDim > slot1_pds) ? (kBlockM * kHeadDim) : slot1_pds)
+        : (kBlockM * kHeadDim + ((kBlockN * kHeadDim > slot1_pds) ? (kBlockN * kHeadDim) : slot1_pds));
+    const int maxbytes = (slot0_elems + slot1_elems) * (int)sizeof(half_t);
 
-    int maxbytes = 65536;
-
+    // 2. Compute dQ across query heads (params.h)
     const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
-
-    
-    // compute dQ
     dim3 dimGrid_dq(num_m_block, params.b, params.h);
     dim3 dimBlock_dq(256);
 
-    //auto dq_kernel = flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal>;
     BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
-    cudaFuncSetAttribute(flash_bwd_dq_kernel<Kernel_traits, Is_causal, Is_even_MN>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
-    flash_bwd_dq_kernel<Kernel_traits, Is_causal, Is_even_MN><<<dimGrid_dq, dimBlock_dq, maxbytes>>>(params.q_ptr,
-                                            params.k_ptr,
-                                            params.v_ptr,
-                                            params.l_ptr,
-                                            params.do_o_ptr,
-                                            params.do_ptr,
-                                            params.dq_ptr,
-                                            params.cu_seqlens_q,
-                                            params.cu_seqlens_k,
-                                            params.b, params.seqlen_q, params.seqlen_k, params.h, params.h_k, params.h_h_k_ratio, params.d, params.softmax_scale, params.is_causal);
+        auto dq_kernel = flash_bwd_dq_kernel<Kernel_traits, Is_causal, Is_even_MN>;
+        if (maxbytes > 49152) {
+            cudaFuncSetAttribute(dq_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
+        }
+        dq_kernel<<<dimGrid_dq, dimBlock_dq, maxbytes, stream>>>(params);
     });
 
+    // 3. Compute dK, dV across KV heads (params.h_k) with in-kernel GQA reduction over h_h_k_ratio
+    const int num_n_block = (params.seqlen_k + kBlockN - 1) / kBlockN;
+    dim3 dimGrid_dk_dv(num_n_block, params.b, params.h_k);
+    dim3 dimBlock_dk_dv(256);
 
-     // compute dK, dV
-
-     const int num_n_block = (params.seqlen_k + kBlockN - 1) / kBlockN;
-     dim3 dimGrid_dk_dv(num_n_block, params.b, params.h);
-     dim3 dimBlock_dk_dv(256);
-
-     BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
-         //auto dk_dv_kernel = flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal>;
-         cudaFuncSetAttribute(flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal, Is_even_MN>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
-         flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal, Is_even_MN><<<dimGrid_dk_dv, dimBlock_dk_dv, maxbytes>>>(params.q_ptr,
-                                                 params.k_ptr,
-                                                 params.v_ptr,
-                                                 params.l_ptr,
-                                                 params.do_o_ptr,
-                                                 params.do_ptr,
-                                                 params.dk_ptr,
-                                                 params.dv_ptr,
-                                                 params.cu_seqlens_q,
-                                                 params.cu_seqlens_k,
-                                                 params.b, params.seqlen_q, params.seqlen_k, params.h, params.h_k, params.h_h_k_ratio, params.d, params.softmax_scale, params.is_causal);
-     });
-
-     
-
-
-
-
-
+    BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
+        auto dk_dv_kernel = flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal, Is_even_MN>;
+        if (maxbytes > 49152) {
+            cudaFuncSetAttribute(dk_dv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
+        }
+        dk_dv_kernel<<<dimGrid_dk_dv, dimBlock_dk_dv, maxbytes, stream>>>(params);
+    });
 }
-
 
 template<bool Is_causal>
 void run_mha_bwd_hdim64(Flash_bwd_params &params) {
@@ -154,10 +85,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params) {
     constexpr static int kNWarps = 8;
 
     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
-
-
 }
-
 
 template<bool Is_causal>
 void run_mha_bwd_hdim96(Flash_bwd_params &params) {
@@ -167,10 +95,7 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params) {
     constexpr static int kNWarps = 8;
 
     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
-
-
 }
-
 
 template<bool Is_causal>
 void run_mha_bwd_hdim128(Flash_bwd_params &params) {
@@ -180,6 +105,24 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params) {
     constexpr static int kNWarps = 8;
 
     run_flash_bwd<Flash_bwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
+}
 
+template<bool Is_causal>
+void run_mha_bwd_hdim32(Flash_bwd_params &params) {
+    constexpr static int Headdim = 32;
+    constexpr static int kBlockM = 64;
+    constexpr static int kBlockN = 64;
+    constexpr static int kNWarps = 8;
 
+    run_flash_bwd<Flash_bwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
+}
+
+template<bool Is_causal>
+void run_mha_bwd_hdim256(Flash_bwd_params &params) {
+    constexpr static int Headdim = 256;
+    constexpr static int kBlockM = 64;
+    constexpr static int kBlockN = 64;
+    constexpr static int kNWarps = 8;
+
+    run_flash_bwd<Flash_bwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
 }

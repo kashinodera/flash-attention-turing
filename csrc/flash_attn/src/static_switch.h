@@ -4,17 +4,6 @@
 
 #pragma once
 
-/// @param COND       - a boolean expression to switch by
-/// @param CONST_NAME - a name given for the constexpr bool variable.
-/// @param ...       - code to execute for true and false
-///
-/// Usage:
-/// ```
-/// BOOL_SWITCH(flag, BoolConst, [&] {
-///     some_function<BoolConst>(...);
-/// });
-/// ```
-
 #define BOOL_SWITCH(COND, CONST_NAME, ...)      \
   [&] {                                         \
     if (COND) {                                 \
@@ -26,17 +15,36 @@
     }                                           \
   }()
 
+#ifdef FA_ONLY_HDIM128
   #define HEADDIM_SWITCH(HEADDIM, ...)        \
     [&] {                                     \
-      if (HEADDIM == 64) {                   \
-        constexpr static int kHeadDim = 64;  \
+      if (HEADDIM == 128) {                   \
+        constexpr static int kHeadDim = 128;  \
         return __VA_ARGS__();                 \
-      } else if (HEADDIM == 96) {            \
-        constexpr static int kHeadDim = 96;  \
-        return __VA_ARGS__();                 \
-      } else if (HEADDIM == 128) {           \
-        constexpr static int kHeadDim = 128;   \
-        return __VA_ARGS__();                 \
+      } else {                                \
+        throw std::runtime_error("fa2-turing was compiled for head_dim=128 only"); \
       }                                       \
     }()
-
+#else
+  #define HEADDIM_SWITCH(HEADDIM, ...)        \
+    [&] {                                     \
+      if (HEADDIM == 32) {                    \
+        constexpr static int kHeadDim = 32;   \
+        return __VA_ARGS__();                 \
+      } else if (HEADDIM == 64) {            \
+        constexpr static int kHeadDim = 64;   \
+        return __VA_ARGS__();                 \
+      } else if (HEADDIM == 96) {            \
+        constexpr static int kHeadDim = 96;   \
+        return __VA_ARGS__();                 \
+      } else if (HEADDIM == 128) {           \
+        constexpr static int kHeadDim = 128;  \
+        return __VA_ARGS__();                 \
+      } else if (HEADDIM == 256) {           \
+        constexpr static int kHeadDim = 256;  \
+        return __VA_ARGS__();                 \
+      } else {                                \
+        throw std::runtime_error("Unsupported head dimension (expected 32, 64, 96, 128, or 256)"); \
+      }                                       \
+    }()
+#endif
